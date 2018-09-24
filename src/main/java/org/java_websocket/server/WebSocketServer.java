@@ -1,12 +1,35 @@
+/*
+ * Copyright (c) 2010-2018 Nathan Rajlich
+ *
+ *  Permission is hereby granted, free of charge, to any person
+ *  obtaining a copy of this software and associated documentation
+ *  files (the "Software"), to deal in the Software without
+ *  restriction, including without limitation the rights to use,
+ *  copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *  copies of the Software, and to permit persons to whom the
+ *  Software is furnished to do so, subject to the following
+ *  conditions:
+ *
+ *  The above copyright notice and this permission notice shall be
+ *  included in all copies or substantial portions of the Software.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ *  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+ *  OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ *  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ *  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ *  WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ *  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ *  OTHER DEALINGS IN THE SOFTWARE.
+ */
+
 package org.java_websocket.server;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.nio.channels.ByteChannel;
 import java.nio.channels.CancelledKeyException;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.SelectableChannel;
@@ -14,33 +37,24 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.java_websocket.SocketChannelIOHelper;
-import org.java_websocket.WebSocket;
-import org.java_websocket.WebSocketAdapter;
-import org.java_websocket.WebSocketFactory;
-import org.java_websocket.WebSocketImpl;
-import org.java_websocket.WrappedByteChannel;
+import org.java_websocket.*;
 import org.java_websocket.drafts.Draft;
 import org.java_websocket.exceptions.InvalidDataException;
+import org.java_websocket.exceptions.WebsocketNotConnectedException;
 import org.java_websocket.framing.CloseFrame;
 import org.java_websocket.framing.Framedata;
 import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.handshake.Handshakedata;
 import org.java_websocket.handshake.ServerHandshakeBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * <tt>WebSocketServer</tt> is an abstract class that only takes care of the
@@ -48,9 +62,16 @@ import org.java_websocket.handshake.ServerHandshakeBuilder;
  * functionality/purpose to the server.
  * 
  */
-public abstract class WebSocketServer extends WebSocketAdapter implements Runnable {
+public abstract class WebSocketServer extends AbstractWebSocket implements Runnable {
 
-	public static int DECODERS = Runtime.getRuntime().availableProcessors();
+	/**
+	 * Logger instance
+	 *
+	 * @since 1.4.0
+	 */
+	private static final Logger log = LoggerFactory.getLogger(WebSocketServer.class);
+
+	private static final int AVAILABLE_PROCESSORS = Runtime.getRuntime().availableProcessors();
 
 	/**
 	 * Holds the list of active WebSocket connections. "Active" means WebSocket
@@ -59,7 +80,7 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 	private final Collection<WebSocket> connections;
 	/**
 	 * The port number that this WebSocket server should listen on. Default is
-	 * WebSocket.DEFAULT_PORT.
+	 * WebSocketImpl.DEFAULT_PORT.
 	 */
 	private final InetSocketAddress address;
 	/**
@@ -79,7 +100,7 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 
 	private final AtomicBoolean isclosed = new AtomicBoolean( false );
 
-	private List<WebSocketWorker> decoders;
+	protected List<WebSocketWorker> decoders;
 
 	private List<WebSocketImpl> iqueue;
 	private BlockingQueue<ByteBuffer> buffers;
@@ -90,39 +111,60 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 
 	/**
 	 * Creates a WebSocketServer that will attempt to
-	 * listen on port <var>WebSocket.DEFAULT_PORT</var>.
+	 * listen on port <var>WebSocketImpl.DEFAULT_PORT</var>.
 	 * 
 	 * @see #WebSocketServer(InetSocketAddress, int, List, Collection) more details here
 	 */
-	public WebSocketServer() throws UnknownHostException {
-		this( new InetSocketAddress( WebSocket.DEFAULT_PORT ), DECODERS, null );
+	public WebSocketServer()  {
+		this( new InetSocketAddress( WebSocketImpl.DEFAULT_PORT ), AVAILABLE_PROCESSORS, null );
 	}
 
 	/**
 	 * Creates a WebSocketServer that will attempt to bind/listen on the given <var>address</var>.
 	 * 
 	 * @see #WebSocketServer(InetSocketAddress, int, List, Collection) more details here
+	 * @param address The address to listen to
 	 */
 	public WebSocketServer( InetSocketAddress address ) {
-		this( address, DECODERS, null );
+		this( address, AVAILABLE_PROCESSORS, null );
 	}
 
 	/**
 	 * @see #WebSocketServer(InetSocketAddress, int, List, Collection) more details here
+	 * @param address
+	 *            The address (host:port) this server should listen on.
+	 * @param decodercount
+	 *            The number of {@link WebSocketWorker}s that will be used to process the incoming network data. By default this will be <code>Runtime.getRuntime().availableProcessors()</code>
 	 */
-	public WebSocketServer( InetSocketAddress address , int decoders ) {
-		this( address, decoders, null );
+	public WebSocketServer( InetSocketAddress address , int decodercount ) {
+		this( address, decodercount, null );
 	}
 
 	/**
 	 * @see #WebSocketServer(InetSocketAddress, int, List, Collection) more details here
+	 *
+	 * @param address
+	 *            The address (host:port) this server should listen on.
+	 * @param drafts
+	 *            The versions of the WebSocket protocol that this server
+	 *            instance should comply to. Clients that use an other protocol version will be rejected.
+	 *
 	 */
 	public WebSocketServer( InetSocketAddress address , List<Draft> drafts ) {
-		this( address, DECODERS, drafts );
+		this( address, AVAILABLE_PROCESSORS, drafts );
 	}
 
 	/**
 	 * @see #WebSocketServer(InetSocketAddress, int, List, Collection) more details here
+	 *
+	 * @param address
+	 *            The address (host:port) this server should listen on.
+	 * @param decodercount
+	 *            The number of {@link WebSocketWorker}s that will be used to process the incoming network data. By default this will be <code>Runtime.getRuntime().availableProcessors()</code>
+	 * @param drafts
+	 *            The versions of the WebSocket protocol that this server
+	 *            instance should comply to. Clients that use an other protocol version will be rejected.
+
 	 */
 	public WebSocketServer( InetSocketAddress address , int decodercount , List<Draft> drafts ) {
 		this( address, decodercount, drafts, new HashSet<WebSocket>() );
@@ -160,7 +202,8 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 
 		this.address = address;
 		this.connections = connectionscontainer;
-
+		setTcpNoDelay(false);
+		setReuseAddr(false);
 		iqueue = new LinkedList<WebSocketImpl>();
 
 		decoders = new ArrayList<WebSocketWorker>( decodercount );
@@ -172,14 +215,15 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 		}
 	}
 
+
 	/**
 	 * Starts the server selectorthread that binds to the currently set port number and
-	 * listeners for WebSocket connection requests. Creates a fixed thread pool with the size {@link WebSocketServer#DECODERS}<br>
+	 * listeners for WebSocket connection requests. Creates a fixed thread pool with the size {@link WebSocketServer#AVAILABLE_PROCESSORS}<br>
 	 * May only be called once.
 	 * 
 	 * Alternatively you can call {@link WebSocketServer#run()} directly.
 	 * 
-	 * @throws IllegalStateException
+	 * @throws IllegalStateException Starting an instance again
 	 */
 	public void start() {
 		if( selectorthread != null )
@@ -197,14 +241,14 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 	 * @param timeout
 	 *            Specifies how many milliseconds the overall close handshaking may take altogether before the connections are closed without proper close handshaking.<br>
 	 * 
-	 * @throws InterruptedException
+	 * @throws InterruptedException Interrupt
 	 */
 	public void stop( int timeout ) throws InterruptedException {
 		if( !isclosed.compareAndSet( false, true ) ) { // this also makes sure that no further connections will be added to this.connections
 			return;
 		}
 
-		List<WebSocket> socketsToClose = null;
+		List<WebSocket> socketsToClose;
 
 		// copy the connections in a list (prevent callback deadlocks)
 		synchronized ( connections ) {
@@ -215,10 +259,11 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 			ws.close( CloseFrame.GOING_AWAY );
 		}
 
+		wsf.close();
+
 		synchronized ( this ) {
-			if( selectorthread != null && selectorthread != Thread.currentThread() ) {
+			if( selectorthread != null  && selector != null) {
 				selector.wakeup();
-				selectorthread.interrupt();
 				selectorthread.join( timeout );
 			}
 		}
@@ -228,14 +273,14 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 	}
 
 	/**
-	 * Returns a WebSocket[] of currently connected clients.
-	 * Its iterators will be failfast and its not judicious
-	 * to modify it.
-	 * 
-	 * @return The currently connected clients.
+	 * Returns  all currently connected clients.
+	 * This collection does not allow any modification e.g. removing a client.
+	 *
+	 * @return A unmodifiable collection of all currently connected clients
+	 * @since 1.3.8
 	 */
-	public Collection<WebSocket> connections() {
-		return this.connections;
+	public Collection<WebSocket> getConnections() {
+		return Collections.unmodifiableCollection( new ArrayList<WebSocket>(connections) );
 	}
 
 	public InetSocketAddress getAddress() {
@@ -269,31 +314,43 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 				return;
 			}
 		}
-		selectorthread.setName( "WebsocketSelector" + selectorthread.getId() );
+		selectorthread.setName( "WebSocketSelector-" + selectorthread.getId() );
 		try {
 			server = ServerSocketChannel.open();
 			server.configureBlocking( false );
 			ServerSocket socket = server.socket();
 			socket.setReceiveBufferSize( WebSocketImpl.RCVBUF );
+			socket.setReuseAddress( isReuseAddr() );
 			socket.bind( address );
 			selector = Selector.open();
 			server.register( selector, server.validOps() );
+			startConnectionLostTimer();
+			onStart();
 		} catch ( IOException ex ) {
 			handleFatal( null, ex );
 			return;
 		}
 		try {
-			while ( !selectorthread.isInterrupted() ) {
+			int iShutdownCount = 5;
+			int selectTimeout = 0;
+			while ( !selectorthread.isInterrupted() && iShutdownCount != 0) {
 				SelectionKey key = null;
 				WebSocketImpl conn = null;
 				try {
-					selector.select();
+					if (isclosed.get()) {
+						selectTimeout = 5;
+					}
+					int keyCount = selector.select( selectTimeout );
+					if (keyCount == 0 && isclosed.get()) {
+						iShutdownCount--;
+					}
 					Set<SelectionKey> keys = selector.selectedKeys();
 					Iterator<SelectionKey> i = keys.iterator();
 
 					while ( i.hasNext() ) {
 						key = i.next();
-
+						conn = null;
+						
 						if( !key.isValid() ) {
 							// Object o = key.attachment();
 							continue;
@@ -306,18 +363,39 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 							}
 
 							SocketChannel channel = server.accept();
+							if(channel==null){
+								continue;
+							}
 							channel.configureBlocking( false );
-							WebSocketImpl w = wsf.createWebSocket( this, drafts, channel.socket() );
-							w.key = channel.register( selector, SelectionKey.OP_READ, w );
-							w.channel = wsf.wrapChannel( channel, w.key );
-							i.remove();
-							allocateBuffers( w );
+							Socket socket = channel.socket();
+							socket.setTcpNoDelay( isTcpNoDelay() );
+							socket.setKeepAlive( true );
+							WebSocketImpl w = wsf.createWebSocket( this, drafts );
+							w.setSelectionKey(channel.register( selector, SelectionKey.OP_READ, w ));
+							try {
+								w.channel = wsf.wrapChannel( channel, w.getSelectionKey() );
+								i.remove();
+								allocateBuffers( w );
+								continue;
+							} catch (IOException ex) {
+								if( w.getSelectionKey() != null )
+									w.getSelectionKey().cancel();
+
+								handleIOException( w.getSelectionKey(), null, ex );
+							}
 							continue;
 						}
 
 						if( key.isReadable() ) {
 							conn = (WebSocketImpl) key.attachment();
 							ByteBuffer buf = takeBuffer();
+							if(conn.channel == null){
+								if( key != null )
+									key.cancel();
+								
+								handleIOException( key, conn, new IOException() );
+								continue;
+							}
 							try {
 								if( SocketChannelIOHelper.read( buf, conn, conn.channel ) ) {
 									if( buf.hasRemaining() ) {
@@ -383,15 +461,25 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 			// should hopefully never occur
 			handleFatal( null, e );
 		} finally {
+			stopConnectionLostTimer();
 			if( decoders != null ) {
 				for( WebSocketWorker w : decoders ) {
 					w.interrupt();
+				}
+			}
+			if( selector != null ) {
+				try {
+					selector.close();
+				} catch ( IOException e ) {
+					log.error( "IOException during selector.close", e );
+					onError( null, e );
 				}
 			}
 			if( server != null ) {
 				try {
 					server.close();
 				} catch ( IOException e ) {
+					log.error( "IOException during server.close", e );
 					onError( null, e );
 				}
 			}
@@ -414,7 +502,7 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 		return ByteBuffer.allocate( WebSocketImpl.RCVBUF );
 	}
 
-	private void queue( WebSocketImpl ws ) throws InterruptedException {
+	protected void queue( WebSocketImpl ws ) throws InterruptedException {
 		if( ws.workerThread == null ) {
 			ws.workerThread = decoders.get( queueinvokes % decoders.size() );
 			queueinvokes++;
@@ -444,39 +532,33 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 				} catch ( IOException e ) {
 					// there is nothing that must be done here
 				}
-				if( WebSocketImpl.DEBUG )
-					System.out.println( "Connection closed because of" + ex );
+				log.trace("Connection closed because of exception",ex);
 			}
 		}
 	}
 
 	private void handleFatal( WebSocket conn, Exception e ) {
+		log.error( "Shutdown due to fatal error", e );
 		onError( conn, e );
+		//Shutting down WebSocketWorkers, see #222
+		if( decoders != null ) {
+			for( WebSocketWorker w : decoders ) {
+				w.interrupt();
+			}
+		}
+		if (selectorthread != null) {
+			selectorthread.interrupt();
+		}
 		try {
 			stop();
 		} catch ( IOException e1 ) {
+			log.error( "Error during shutdown", e1 );
 			onError( null, e1 );
 		} catch ( InterruptedException e1 ) {
 			Thread.currentThread().interrupt();
+			log.error( "Interrupt during stop", e );
 			onError( null, e1 );
 		}
-	}
-
-	/**
-	 * Gets the XML string that should be returned if a client requests a Flash
-	 * security policy.
-	 * 
-	 * The default implementation allows access from all remote domains, but
-	 * only on the port that this WebSocketServer is listening on.
-	 * 
-	 * This is specifically implemented for gitime's WebSocket client for Flash:
-	 * http://github.com/gimite/web-socket-js
-	 * 
-	 * @return An XML String that comforms to Flash's security policy. You MUST
-	 *         not include the null char at the end, it is appended automatically.
-	 */
-	protected String getFlashSecurityPolicy() {
-		return "<cross-domain-policy><allow-access-from domain=\"*\" to-ports=\"" + getPort() + "\" /></cross-domain-policy>";
 	}
 
 	@Override
@@ -484,11 +566,6 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 		onMessage( conn, message );
 	}
 
-	@Override
-	@Deprecated
-	public/*final*/void onWebsocketMessageFragment( WebSocket conn, Framedata frame ) {// onFragment should be overloaded instead
-		onFragment( conn, frame );
-	}
 
 	@Override
 	public final void onWebsocketMessage( WebSocket conn, ByteBuffer blob ) {
@@ -524,12 +601,18 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 	 * <p>
 	 * {@link #WebSocketServer(InetSocketAddress, int, List, Collection)} allows to specify a collection which will be used to store current connections in.<br>
 	 * Depending on the type on the connection, modifications of that collection may have to be synchronized.
-	 **/
+	 * @param ws The Webscoket connection which should be removed
+	 * @return Removing connection successful
+	 */
 	protected boolean removeConnection( WebSocket ws ) {
-		boolean removed;
+		boolean removed = false;
 		synchronized ( connections ) {
-			removed = this.connections.remove( ws );
-			assert ( removed );
+			if (this.connections.contains( ws )) {
+				removed = this.connections.remove( ws );
+			} else {
+				//Don't throw an assert error if the ws is not in the list. e.g. when the other endpoint did not send any handshake. see #512
+				log.trace("Removing connection which is not in the connections collection! Possible no handshake recieved! {}", ws);
+			}
 		}
 		if( isclosed.get() && connections.size() == 0 ) {
 			selectorthread.interrupt();
@@ -541,7 +624,11 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 		return super.onWebsocketHandshakeReceivedAsServer( conn, draft, request );
 	}
 
-	/** @see #removeConnection(WebSocket) */
+	/**
+	 * @see #removeConnection(WebSocket)
+	 * @param ws the Webscoket connection which should be added
+	 * @return Adding connection successful
+	 */
 	protected boolean addConnection( WebSocket ws ) {
 		if( !isclosed.get() ) {
 			synchronized ( connections ) {
@@ -555,10 +642,7 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 			return true;// for consistency sake we will make sure that both onOpen will be called
 		}
 	}
-	/**
-	 * @param conn
-	 *            may be null if the error does not belong to a single connection
-	 */
+
 	@Override
 	public final void onWebsocketError( WebSocket conn, Exception ex ) {
 		onError( conn, ex );
@@ -568,7 +652,7 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 	public final void onWriteDemand( WebSocket w ) {
 		WebSocketImpl conn = (WebSocketImpl) w;
 		try {
-			conn.key.interestOps( SelectionKey.OP_READ | SelectionKey.OP_WRITE );
+			conn.getSelectionKey().interestOps( SelectionKey.OP_READ | SelectionKey.OP_WRITE );
 		} catch ( CancelledKeyException e ) {
 			// the thread which cancels key is responsible for possible cleanup
 			conn.outQueue.clear();
@@ -595,6 +679,8 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 	}
 
 	public final void setWebSocketFactory( WebSocketServerFactory wsf ) {
+		if (this.wsf != null)
+			this.wsf.close();
 		this.wsf = wsf;
 	}
 
@@ -608,14 +694,22 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 	 * 
 	 * @see #onOpen(WebSocket, ClientHandshake)
          * @see #onWebsocketHandshakeReceivedAsServer(WebSocket, Draft, ClientHandshake)
+	 * @param key the SelectionKey for the new connection
+	 * @return Can this new connection be accepted
 	 **/
 	protected boolean onConnect( SelectionKey key ) {
+		//FIXME
 		return true;
 	}
 
+	/**
+	 * Getter to return the socket used by this specific connection
+	 * @param conn The specific connection
+	 * @return The socket used by this connection
+	 */
 	private Socket getSocket( WebSocket conn ) {
 		WebSocketImpl impl = (WebSocketImpl) conn;
-		return ( (SocketChannel) impl.key.channel() ).socket();
+		return ( (SocketChannel) impl.getSelectionKey().channel() ).socket();
 	}
 
 	@Override
@@ -628,11 +722,15 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 		return (InetSocketAddress) getSocket( conn ).getRemoteSocketAddress();
 	}
 
-	/** Called after an opening handshake has been performed and the given websocket is ready to be written on. */
+	/** Called after an opening handshake has been performed and the given websocket is ready to be written on.
+	 * @param conn The <tt>WebSocket</tt> instance this event is occuring on.
+	 * @param handshake The handshake of the websocket instance
+	 */
 	public abstract void onOpen( WebSocket conn, ClientHandshake handshake );
 	/**
 	 * Called after the websocket connection has been closed.
-	 * 
+	 *
+	 * @param conn The <tt>WebSocket</tt> instance this event is occuring on.
 	 * @param code
 	 *            The codes can be looked up here: {@link CloseFrame}
 	 * @param reason
@@ -645,6 +743,8 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 	 * Callback for string messages received from the remote host
 	 * 
 	 * @see #onMessage(WebSocket, ByteBuffer)
+	 * @param conn The <tt>WebSocket</tt> instance this event is occuring on.
+	 * @param message The UTF-8 decoded message that was received.
 	 **/
 	public abstract void onMessage( WebSocket conn, String message );
 	/**
@@ -652,24 +752,136 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 	 * This method will be called primarily because of IO or protocol errors.<br>
 	 * If the given exception is an RuntimeException that probably means that you encountered a bug.<br>
 	 * 
-	 * @param conn
-	 *            Can be null if there error does not belong to one specific websocket. For example if the servers port could not be bound.
+	 * @param conn Can be null if there error does not belong to one specific websocket. For example if the servers port could not be bound.
+	 * @param ex The exception causing this error
 	 **/
 	public abstract void onError( WebSocket conn, Exception ex );
+
+	/**
+	 * Called when the server started up successfully.
+	 *
+	 * If any error occured, onError is called instead.
+	 */
+	public abstract void onStart();
+
 	/**
 	 * Callback for binary messages received from the remote host
 	 * 
-	 * @see #onMessage(WebSocket, String)
+	 * @see #onMessage(WebSocket, ByteBuffer)
+	 *
+	 *  @param conn
+	 *            The <tt>WebSocket</tt> instance this event is occurring on.
+	 * @param message
+	 *            The binary message that was received.
 	 **/
 	public void onMessage( WebSocket conn, ByteBuffer message ) {
 	}
 
 	/**
-	 * @see WebSocket#sendFragmentedFrame(org.java_websocket.framing.Framedata.Opcode, ByteBuffer, boolean)
+	 * Send a text to all connected endpoints
+	 * @param text the text to send to the endpoints
 	 */
-	public void onFragment( WebSocket conn, Framedata fragment ) {
+	public void broadcast(String text) {
+		broadcast( text, connections );
 	}
 
+	/**
+	 * Send a byte array to all connected endpoints
+	 * @param data the data to send to the endpoints
+	 */
+	public void broadcast(byte[] data) {
+		broadcast( data, connections );
+	}
+
+	/**
+	 * Send a ByteBuffer to all connected endpoints
+	 * @param data the data to send to the endpoints
+	 */
+	public void broadcast(ByteBuffer data) {
+		broadcast(data, connections);
+	}
+
+	/**
+	 * Send a byte array to a specific collection of websocket connections
+	 * @param data the data to send to the endpoints
+	 * @param clients a collection of endpoints to whom the text has to be send
+	 */
+	public void broadcast(byte[] data, Collection<WebSocket> clients) {
+		if (data == null || clients == null) {
+			throw new IllegalArgumentException();
+		}
+		broadcast(ByteBuffer.wrap(data), clients);
+	}
+
+	/**
+	 * Send a ByteBuffer to a specific collection of websocket connections
+	 * @param data the data to send to the endpoints
+	 * @param clients a collection of endpoints to whom the text has to be send
+	 */
+	public void broadcast(ByteBuffer data, Collection<WebSocket> clients) {
+		if (data == null || clients == null) {
+			throw new IllegalArgumentException();
+		}
+		doBroadcast(data, clients);
+	}
+
+	/**
+	 * Send a text to a specific collection of websocket connections
+	 * @param text the text to send to the endpoints
+	 * @param clients a collection of endpoints to whom the text has to be send
+	 */
+	public void broadcast(String text, Collection<WebSocket> clients) {
+		if (text == null || clients == null) {
+			throw new IllegalArgumentException();
+		}
+		doBroadcast(text, clients);
+	}
+
+	/**
+	 * Private method to cache all the frames to improve memory footprint and conversion time
+	 * @param data the data to broadcast
+	 * @param clients the clients to send the message to
+	 */
+	private void doBroadcast(Object data, Collection<WebSocket> clients) {
+		String sData = null;
+		if (data instanceof String) {
+			sData = (String)data;
+		}
+		ByteBuffer bData = null;
+		if (data instanceof ByteBuffer) {
+			bData = (ByteBuffer)data;
+		}
+		if (sData == null && bData == null) {
+			return;
+		}
+		Map<Draft, List<Framedata>> draftFrames = new HashMap<Draft, List<Framedata>>();
+		for( WebSocket client : clients ) {
+			if( client != null ) {
+				Draft draft = client.getDraft();
+				if( !draftFrames.containsKey( draft ) ) {
+					List<Framedata> frames = null;
+					if (sData != null) {
+						frames = draft.createFrames( sData, false );
+					}
+					if (bData != null) {
+						frames = draft.createFrames( bData, false );
+					}
+					if (frames != null) {
+						draftFrames.put(draft, frames);
+					}
+				}
+				try {
+					client.sendFrame( draftFrames.get( draft ) );
+				} catch ( WebsocketNotConnectedException e ) {
+					//Ignore this exception in this case
+				}
+			}
+		}
+	}
+
+	/**
+	 * This class is used to process incoming data
+	 */
 	public class WebSocketWorker extends Thread {
 
 		private BlockingQueue<WebSocketImpl> iqueue;
@@ -680,7 +892,7 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 			setUncaughtExceptionHandler( new UncaughtExceptionHandler() {
 				@Override
 				public void uncaughtException( Thread t, Throwable e ) {
-					getDefaultUncaughtExceptionHandler().uncaughtException( t, e );
+					log.error("Uncaught exception in thread {}: {}", t.getName(), e);
 				}
 			} );
 		}
@@ -694,14 +906,14 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 			WebSocketImpl ws = null;
 			try {
 				while ( true ) {
-					ByteBuffer buf = null;
+					ByteBuffer buf;
 					ws = iqueue.take();
 					buf = ws.inQueue.poll();
 					assert ( buf != null );
 					try {
 						ws.decode( buf );
 					} catch(Exception e){
-						System.err.println("Error while reading from remote connection: " + e);
+						log.error("Error while reading from remote connection", e);
 					}
 					
 					finally {
@@ -709,25 +921,10 @@ public abstract class WebSocketServer extends WebSocketAdapter implements Runnab
 					}
 				}
 			} catch ( InterruptedException e ) {
+				Thread.currentThread().interrupt();
 			} catch ( RuntimeException e ) {
 				handleFatal( ws, e );
 			}
 		}
-	}
-
-	public interface WebSocketServerFactory extends WebSocketFactory {
-		@Override
-		public WebSocketImpl createWebSocket( WebSocketAdapter a, Draft d, Socket s );
-
-		public WebSocketImpl createWebSocket( WebSocketAdapter a, List<Draft> drafts, Socket s );
-
-		/**
-		 * Allows to wrap the Socketchannel( key.channel() ) to insert a protocol layer( like ssl or proxy authentication) beyond the ws layer.
-		 * 
-		 * @param key
-		 *            a SelectionKey of an open SocketChannel.
-		 * @return The channel on which the read and write operations will be performed.<br>
-		 */
-		public ByteChannel wrapChannel( SocketChannel channel, SelectionKey key ) throws IOException;
 	}
 }

@@ -1,3 +1,28 @@
+/*
+ * Copyright (c) 2010-2018 Nathan Rajlich
+ *
+ *  Permission is hereby granted, free of charge, to any person
+ *  obtaining a copy of this software and associated documentation
+ *  files (the "Software"), to deal in the Software without
+ *  restriction, including without limitation the rights to use,
+ *  copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *  copies of the Software, and to permit persons to whom the
+ *  Software is furnished to do so, subject to the following
+ *  conditions:
+ *
+ *  The above copyright notice and this permission notice shall be
+ *  included in all copies or substantial portions of the Software.
+ *
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ *  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+ *  OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ *  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ *  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ *  WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ *  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ *  OTHER DEALINGS IN THE SOFTWARE.
+ */
+
 package org.java_websocket.drafts;
 
 import java.nio.ByteBuffer;
@@ -6,16 +31,15 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 
-import org.java_websocket.WebSocket.Role;
+import org.java_websocket.WebSocketImpl;
+import org.java_websocket.enums.CloseHandshakeType;
+import org.java_websocket.enums.HandshakeState;
+import org.java_websocket.enums.Opcode;
+import org.java_websocket.enums.Role;
 import org.java_websocket.exceptions.IncompleteHandshakeException;
 import org.java_websocket.exceptions.InvalidDataException;
 import org.java_websocket.exceptions.InvalidHandshakeException;
-import org.java_websocket.exceptions.LimitExedeedException;
-import org.java_websocket.framing.CloseFrame;
-import org.java_websocket.framing.FrameBuilder;
-import org.java_websocket.framing.Framedata;
-import org.java_websocket.framing.Framedata.Opcode;
-import org.java_websocket.framing.FramedataImpl1;
+import org.java_websocket.framing.*;
 import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.handshake.ClientHandshakeBuilder;
 import org.java_websocket.handshake.HandshakeBuilder;
@@ -31,21 +55,6 @@ import org.java_websocket.util.Charsetfunctions;
  **/
 public abstract class Draft {
 
-	public enum HandshakeState {
-		/** Handshake matched this Draft successfully */
-		MATCHED,
-		/** Handshake is does not match this Draft */
-		NOT_MATCHED
-	}
-	public enum CloseHandshakeType {
-		NONE, ONEWAY, TWOWAY
-	}
-
-	public static int MAX_FAME_SIZE = 1000 * 1;
-	public static int INITIAL_FAMESIZE = 64;
-
-	public static final byte[] FLASH_POLICY_REQUEST = Charsetfunctions.utf8Bytes( "<policy-file-request/>\0" );
-
 	/** In some cases the handshake will be parsed different depending on whether */
 	protected Role role = null;
 
@@ -53,7 +62,7 @@ public abstract class Draft {
 
 	public static ByteBuffer readLine( ByteBuffer buf ) {
 		ByteBuffer sbuf = ByteBuffer.allocate( buf.remaining() );
-		byte prev = '0';
+		byte prev;
 		byte cur = '0';
 		while ( buf.hasRemaining() ) {
 			prev = cur;
@@ -76,7 +85,7 @@ public abstract class Draft {
 		return b == null ? null : Charsetfunctions.stringAscii( b.array(), 0, b.limit() );
 	}
 
-	public static HandshakeBuilder translateHandshakeHttp( ByteBuffer buf, Role role ) throws InvalidHandshakeException , IncompleteHandshakeException {
+	public static HandshakeBuilder translateHandshakeHttp( ByteBuffer buf, Role role ) throws InvalidHandshakeException {
 		HandshakeBuilder handshake;
 
 		String line = readStringLine( buf );
@@ -87,26 +96,22 @@ public abstract class Draft {
 		if( firstLineTokens.length != 3 ) {
 			throw new InvalidHandshakeException();
 		}
-
 		if( role == Role.CLIENT ) {
-			// translating/parsing the response from the SERVER
-			handshake = new HandshakeImpl1Server();
-			ServerHandshakeBuilder serverhandshake = (ServerHandshakeBuilder) handshake;
-			serverhandshake.setHttpStatus( Short.parseShort( firstLineTokens[ 1 ] ) );
-			serverhandshake.setHttpStatusMessage( firstLineTokens[ 2 ] );
+			handshake = prvTranslateHandshakeHttpClient(firstLineTokens, line);
 		} else {
-			// translating/parsing the request from the CLIENT
-			ClientHandshakeBuilder clienthandshake = new HandshakeImpl1Client();
-			clienthandshake.setResourceDescriptor( firstLineTokens[ 1 ] );
-			handshake = clienthandshake;
+			handshake = prvTranslateHandshakeHttpServer(firstLineTokens, line);
 		}
-
 		line = readStringLine( buf );
 		while ( line != null && line.length() > 0 ) {
 			String[] pair = line.split( ":", 2 );
 			if( pair.length != 2 )
 				throw new InvalidHandshakeException( "not an http header" );
-			handshake.put( pair[ 0 ], pair[ 1 ].replaceFirst( "^ +", "" ) );
+			// If the handshake contains already a specific key, append the new value
+			if ( handshake.hasFieldValue( pair[ 0 ] ) ) {
+				handshake.put( pair[0], handshake.getFieldValue( pair[ 0 ] ) + "; " + pair[1].replaceFirst( "^ +", "" ) );
+			} else {
+				handshake.put( pair[0], pair[1].replaceFirst( "^ +", "" ) );
+			}
 			line = readStringLine( buf );
 		}
 		if( line == null )
@@ -114,38 +119,91 @@ public abstract class Draft {
 		return handshake;
 	}
 
+	/**
+	 * Checking the handshake for the role as server
+	 * @return a handshake
+	 * @param firstLineTokens the token of the first line split as as an string array
+	 * @param line the whole line
+	 */
+	private static HandshakeBuilder prvTranslateHandshakeHttpServer(String[] firstLineTokens, String line) throws InvalidHandshakeException {
+		// translating/parsing the request from the CLIENT
+		if (!"GET".equalsIgnoreCase(firstLineTokens[0])) {
+			throw new InvalidHandshakeException( String.format("Invalid request method received: %s Status line: %s", firstLineTokens[0],line));
+		}
+		if (!"HTTP/1.1".equalsIgnoreCase(firstLineTokens[2])) {
+			throw new InvalidHandshakeException( String.format("Invalid status line received: %s Status line: %s", firstLineTokens[2], line));
+		}
+		ClientHandshakeBuilder clienthandshake = new HandshakeImpl1Client();
+		clienthandshake.setResourceDescriptor( firstLineTokens[ 1 ] );
+		return clienthandshake;
+	}
+
+	/**
+	 * Checking the handshake for the role as client
+	 * @return a handshake
+	 * @param firstLineTokens the token of the first line split as as an string array
+	 * @param line the whole line
+	 */
+	private static HandshakeBuilder prvTranslateHandshakeHttpClient(String[] firstLineTokens, String line) throws InvalidHandshakeException {
+		// translating/parsing the response from the SERVER
+		if (!"101".equals(firstLineTokens[1])) {
+			throw new InvalidHandshakeException( String.format("Invalid status code received: %s Status line: %s", firstLineTokens[1], line));
+		}
+		if (!"HTTP/1.1".equalsIgnoreCase(firstLineTokens[0])) {
+			throw new InvalidHandshakeException( String.format("Invalid status line received: %s Status line: %s", firstLineTokens[0], line));
+		}
+		HandshakeBuilder handshake = new HandshakeImpl1Server();
+		ServerHandshakeBuilder serverhandshake = (ServerHandshakeBuilder) handshake;
+		serverhandshake.setHttpStatus( Short.parseShort( firstLineTokens[ 1 ] ) );
+		serverhandshake.setHttpStatusMessage( firstLineTokens[ 2 ] );
+		return handshake;
+	}
+
 	public abstract HandshakeState acceptHandshakeAsClient( ClientHandshake request, ServerHandshake response ) throws InvalidHandshakeException;
 
-	public abstract HandshakeState acceptHandshakeAsServer( ClientHandshake handshakedata ) throws InvalidHandshakeException;
+	public abstract HandshakeState acceptHandshakeAsServer(ClientHandshake handshakedata ) throws InvalidHandshakeException;
 
 	protected boolean basicAccept( Handshakedata handshakedata ) {
 		return handshakedata.getFieldValue( "Upgrade" ).equalsIgnoreCase( "websocket" ) && handshakedata.getFieldValue( "Connection" ).toLowerCase( Locale.ENGLISH ).contains( "upgrade" );
 	}
 
-	public abstract ByteBuffer createBinaryFrame( Framedata framedata ); // TODO Allow to send data on the base of an Iterator or InputStream
+	public abstract ByteBuffer createBinaryFrame( Framedata framedata );
 
 	public abstract List<Framedata> createFrames( ByteBuffer binary, boolean mask );
 
 	public abstract List<Framedata> createFrames( String text, boolean mask );
 
-	public List<Framedata> continuousFrame( Opcode op, ByteBuffer buffer, boolean fin ) {
-		if( op != Opcode.BINARY && op != Opcode.TEXT && op != Opcode.TEXT ) {
+
+	/**
+	 * Handle the frame specific to the draft
+	 * @param webSocketImpl the websocketimpl used for this draft
+	 * @param frame the frame which is supposed to be handled
+	 * @throws InvalidDataException will be thrown on invalid data
+	 */
+	public abstract void processFrame( WebSocketImpl webSocketImpl, Framedata frame ) throws InvalidDataException;
+
+	public List<Framedata> continuousFrame(Opcode op, ByteBuffer buffer, boolean fin ) {
+		if(op != Opcode.BINARY && op != Opcode.TEXT) {
 			throw new IllegalArgumentException( "Only Opcode.BINARY or  Opcode.TEXT are allowed" );
 		}
-
+		DataFrame bui = null;
 		if( continuousFrameType != null ) {
-			continuousFrameType = Opcode.CONTINUOUS;
+			bui = new ContinuousFrame();
 		} else {
 			continuousFrameType = op;
+			if (op == Opcode.BINARY) {
+				bui = new BinaryFrame();
+			} else if (op == Opcode.TEXT) {
+				bui = new TextFrame();
+			}
 		}
-
-		FrameBuilder bui = new FramedataImpl1( continuousFrameType );
-		try {
-			bui.setPayload( buffer );
-		} catch ( InvalidDataException e ) {
-			throw new RuntimeException( e ); // can only happen when one builds close frames(Opcode.Close)
-		}
+		bui.setPayload( buffer );
 		bui.setFin( fin );
+		try {
+			bui.isValid();
+		} catch ( InvalidDataException e ) {
+			throw new IllegalArgumentException( e ); // can only happen when one builds close frames(Opcode.Close)
+		}
 		if( fin ) {
 			continuousFrameType = null;
 		} else {
@@ -167,9 +225,9 @@ public abstract class Draft {
 			bui.append( ( (ClientHandshake) handshakedata ).getResourceDescriptor() );
 			bui.append( " HTTP/1.1" );
 		} else if( handshakedata instanceof ServerHandshake ) {
-			bui.append( "HTTP/1.1 101 " + ( (ServerHandshake) handshakedata ).getHttpStatusMessage() );
+			bui.append("HTTP/1.1 101 ").append(((ServerHandshake) handshakedata).getHttpStatusMessage());
 		} else {
-			throw new RuntimeException( "unknow role" );
+			throw new IllegalArgumentException( "unknown role" );
 		}
 		bui.append( "\r\n" );
 		Iterator<String> it = handshakedata.iterateHttpFields();
@@ -204,17 +262,32 @@ public abstract class Draft {
 	/**
 	 * Drafts must only be by one websocket at all. To prevent drafts to be used more than once the Websocket implementation should call this method in order to create a new usable version of a given draft instance.<br>
 	 * The copy can be safely used in conjunction with a new websocket connection.
-	 * */
+	 * @return a copy of the draft
+	 */
 	public abstract Draft copyInstance();
 
 	public Handshakedata translateHandshake( ByteBuffer buf ) throws InvalidHandshakeException {
 		return translateHandshakeHttp( buf, role );
 	}
 
-	public int checkAlloc( int bytecount ) throws LimitExedeedException , InvalidDataException {
+	public int checkAlloc( int bytecount ) throws InvalidDataException {
 		if( bytecount < 0 )
 			throw new InvalidDataException( CloseFrame.PROTOCOL_ERROR, "Negative count" );
 		return bytecount;
+	}
+
+	int readVersion( Handshakedata handshakedata ) {
+		String vers = handshakedata.getFieldValue( "Sec-WebSocket-Version" );
+		if( vers.length() > 0 ) {
+			int v;
+			try {
+				v = new Integer( vers.trim() );
+				return v;
+			} catch ( NumberFormatException e ) {
+				return -1;
+			}
+		}
+		return -1;
 	}
 
 	public void setParseMode( Role role ) {
@@ -223,6 +296,10 @@ public abstract class Draft {
 	
 	public Role getRole() {
 		return role;
+	}
+
+	public String toString() {
+		return getClass().getSimpleName();
 	}
 
 }
